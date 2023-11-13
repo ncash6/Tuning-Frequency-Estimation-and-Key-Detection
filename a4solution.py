@@ -80,25 +80,36 @@ def estimate_tuning_freq(x, blockSize, hopSize, fs):
 
 
 # B.1
-def extract_pitch_chroma(X, fs, tfInHz):
-    n_blocks = X.shape[0]
-    n_bins = X.shape[1]
-    pitchChroma = np.zeros((12, n_blocks))
-    # C3 to B5 MIDI notes 48 to 83
-    base_midi = np.arange(48, 84)
-    base_freq = 440 * 2 ** ((base_midi - 69) / 12)
-    adjusted_freq = base_freq * tfInHz / 440 # adjust freq for tuning freq
-
-    pitch_classes = np.mod(base_midi, 12)
-    for i in range(n_blocks):
-        block = X[i, :]
-        for pitch_classes in range(12):
-            indices = np.where(pitch_classes == pitch_classes)[0]
-            pitchChroma[pitch_classes, i] = np.sum(block[indices])
+def generate_pc_filters(fs, spec_length, tfInHz):
+    f_mid = 261.63 * (tfInHz/440)  # Starting at C4
+    num_octaves = 4
+    # Adjust the number of octaves to fit within the Nyquist frequency
+    while f_mid * 2 ** num_octaves > fs / 2:
+        num_octaves -= 1
+    
+    H = np.zeros((12, spec_length))
+    
+    for i in range(12):
+        # Calculate semitone boundaries in Hz
+        af_bounds = 2 ** np.array([-1/24, 1/24]) * f_mid * 2 * (spec_length - 1) / fs
+        for j in range(num_octaves):
+            i_bounds = [int(np.ceil(2 ** (j - 1) * af_bounds[0])), 
+                        int(np.floor(2 ** (j - 1) * af_bounds[1]))]
+            # Ensure that the end index is not less than the start index
+            if i_bounds[1] >= i_bounds[0]:
+                H[i, i_bounds[0]:i_bounds[1]+1] = 1 / (i_bounds[1] - i_bounds[0] + 1)
         
-        norm = np.linalg.norm(pitchChroma[:, i])
-        if norm > 0:
-            pitchChroma[:, i] /= norm
+        # Increment to the next semitone
+        f_mid *= 2 ** (1/12)
+    
+    return H
+def extract_pitch_chroma(X, fs, tfInHz):
+    spec_length = X.shape[0]
+    H = generate_pc_filters(fs, spec_length, tfInHz)
+    pitchChroma = np.dot(H, X ** 2)
+    pitchChroma /= np.sum(pitchChroma, axis=0, keepdims=True)
+    # avoid 0s
+    pitchChroma[:, np.sum(X, axis=0) == 0] = 0
 
     return pitchChroma
 
@@ -112,7 +123,7 @@ def detect_key(x, blockSize, hopSize, fs, bTune):
         tfInHz = 440
     # block and spectrogram
     xb, _ = block_audio(x, blockSize, hopSize, fs)
-    X = hann_fft(xb)
+    X = hann_fft(xb).T # cloumns are blocks
     # extract pitch chroma
     pitchChroma = extract_pitch_chroma(X, fs, tfInHz)
     # Krumhansl key profiles
@@ -131,7 +142,8 @@ def detect_key(x, blockSize, hopSize, fs, bTune):
     min_dist_minor = float('inf')
     keyEstimate_major = None
     keyEstimate_minor = None
-    key_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    key_names_major = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    key_names_minor = ['c', 'c#', 'd', 'd#', 'e', 'f', 'f#', 'g', 'g#', 'a', 'a#', 'b']
 
     # compare aggregated chroma w/ each major/minor profile
     for i in range(12):
@@ -139,32 +151,29 @@ def detect_key(x, blockSize, hopSize, fs, bTune):
         dist_major = np.linalg.norm(agg_chroma - major_profiles[i])
         if dist_major < min_dist_major:
             min_dist_major = dist_major
-            keyEstimate_major = key_names[i] + ' Major'
+            keyEstimate_major = key_names_major[i]
         # minor
         dist_minor = np.linalg.norm(agg_chroma - minor_profiles[i])
         if dist_minor < min_dist_minor:
             min_dist_minor = dist_minor
-            keyEstimate_minor = key_names[i] + ' Minor'
+            keyEstimate_minor = key_names_minor[i]
 
     # find if the closest match is major or minor
     keyEstimate = keyEstimate_major if min_dist_major < min_dist_minor else keyEstimate_minor
     return keyEstimate
 
-
 # C1
 
-# Set the block size and hop size for spectrogram computation
 blockSize = 4096
 hopSize = 2048
 
-# Set the number of spectral peaks for tuning frequency estimation
 num_peaks = 20
 
 # Set the cents scale for tuning frequency estimation
 cents_scale = np.arange(0, 1200, 100)
 
 # Set the tuning frequency correction flag
-bTune = True  # True if you want to apply tuning frequency correction, False otherwise
+bTune = True  
 
 
 def load_audio(file_path):
@@ -175,16 +184,6 @@ def load_audio(file_path):
     return x, fs
 
 def eval_tfe(pathToAudio, pathToGT):
-    """
-    Evaluates tuning frequency estimation for the audio files in the given directory.
-
-    Parameters:
-    pathToAudio (str): Path to the directory containing audio files.
-    pathToGT (str): Path to the directory containing ground truth tuning frequency files.
-
-    Returns:
-    avgDeviation (float): Average absolute deviation of tuning frequency estimation in cents.
-    """
     # Get a list of audio file names
     audio_files = os.listdir(pathToAudio)
 
@@ -193,7 +192,6 @@ def eval_tfe(pathToAudio, pathToGT):
 
     for audio_file in audio_files:
         if audio_file.endswith(".wav"):
-            # Load the audio file
             x, fs = load_audio(os.path.join(pathToAudio, audio_file))
 
             # Compute the tuning frequency estimation
@@ -219,16 +217,6 @@ def eval_tfe(pathToAudio, pathToGT):
 # C2
 
 def eval_key_detection(pathToAudio, pathToGT):
-    """
-    Evaluates key detection for the audio files in the given directory.
-
-    Parameters:
-    pathToAudio (str): Path to the directory containing audio files.
-    pathToGT (str): Path to the directory containing ground truth key label files.
-
-    Returns:
-    accuracy (numpy.ndarray): Array with accuracy values for key detection with and without tuning frequency correction.
-    """
     # Get a list of audio file names
     audio_files = os.listdir(pathToAudio)
 
@@ -238,12 +226,9 @@ def eval_key_detection(pathToAudio, pathToGT):
 
     for audio_file in audio_files:
         if audio_file.endswith(".wav"):
-            # Load the audio file
             x, fs = load_audio(os.path.join(pathToAudio, audio_file))
-
             # Compute key detection with tuning frequency correction
             key_estimate_with_tune = detect_key(x, blockSize=4096, hopSize=2048, fs=fs, bTune=True)
-
             # Compute key detection without tuning frequency correction
             key_estimate_without_tune = detect_key(x, blockSize=4096, hopSize=2048, fs=fs, bTune=False)
 
@@ -251,7 +236,11 @@ def eval_key_detection(pathToAudio, pathToGT):
             gt_file = os.path.join(pathToGT, audio_file.replace(".wav", ".txt"))
             with open(gt_file, "r") as f:
                 gt_key = f.read().strip()
-
+            gt_key = int(gt_key)
+            label_to_key_names = ['A', 'A#', 'B', 'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#',
+                                 'a', 'a#', 'b', 'c', 'c#', 'd', 'd#', 'e', 'f', 'f#', 'g', 'g#']
+            gt_key = label_to_key_names[gt_key]
+            print(audio_file, " estimate:", key_estimate_with_tune, "   gt:", gt_key)
             # Compare key estimates with ground truth
             if key_estimate_with_tune == gt_key:
                 accuracy_with_tune += 1
@@ -270,9 +259,9 @@ def eval_key_detection(pathToAudio, pathToGT):
 
 def evaluate(pathToAudioKey, pathToGTKey,pathToAudioTf, pathToGTTf):
 
-    avg_deviationInCent = eval_tfe(audio_tf_dir, gt_tf_dir)
+    avg_deviationInCent = eval_tfe(pathToAudioTf, pathToGTTf)
 
-    avg_accuracy = eval_key_detection(audio_key_dir, gt_key_dir)
+    avg_accuracy = eval_key_detection(pathToAudioKey, pathToGTKey)
 
     return avg_accuracy, avg_deviationInCent
 
@@ -280,7 +269,7 @@ def evaluate(pathToAudioKey, pathToGTKey,pathToAudioTf, pathToGTTf):
 ##----------------------------------------------- Evaluation Function Call -----------------------------------------------##
 
 # Replace with the path to your data directory
-mainDirectory = "/Users/nicolettecash/Downloads/key_tf" 
+mainDirectory = "/Users/sut2/Documents/GTcourses/MUSI6201/key_tf" 
 
 # Set the directories for audio and ground truth data
 audio_key_dir = os.path.join(mainDirectory, "key_eval/audio")
